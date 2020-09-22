@@ -1,8 +1,46 @@
-USE AdminDB
+USE AdminDB -- set a database, in which you want to create this procedure (do not use system databases)
 GO
 
-CREATE OR ALTER PROCEDURE spr_ManageVLFs
-	@dbName NVARCHAR(256) = 'LargeDB'
+/*
+Author: Antonio Turkovic (Microsoft Data&AI CE)
+Version: 202009-01
+Supported SQL Server Versions: >= SQL Server 2016 SP2 (Standard and Enterprise Edition)	
+
+Description:
+This script can be used to distribute optimize the amount of VLFs (virtual log files).
+It will create a stored procedure called "dbo.spr_ManageVLFs".
+
+Requirements:
+- User must have SYSADMIN privileges
+- BEFORE running the process, perform a FULL backup of your database (database will be set to SIMPLE recovery model)
+- AFTER running the process, perform another FULL backup to start a new backup chain (database will be set to the initial recovery model)
+- Log file must be larger than 512 MB
+- Only one Transaction log file is allowed
+
+
+Parameter:
+	- @dbName: Specify the database you want to work with
+		- Database must not be a member of an Availability Group
+		- Ensure that no users are working on the database during the entire process
+
+Best Practices:
+	- It is best practice to reduce the amount of VLFs, if there are more than 1000
+		- run "DBCC LOGINFO" or "SELECT * FROM master.sys.dm_db_log_info(DB_ID('database_name'))" to get total VLF count
+	- This script applies all best practices according to docs.microsoft.com
+		- https://docs.microsoft.com/en-us/sql/relational-databases/sql-server-transaction-log-architecture-and-management-guide?view=sql-server-ver15#physical_arch
+
+Example:
+	- on a database with a current log size of 17937 MB having 897 VLFs
+	- EXEC dbo.spr_ManageVLFs @dbName = 'myDB'
+		- New log file size will be 16384 MB (pre-sized in 8192 MB steps), autogrowth set to 512 MB and a total of 34 VLFs 
+Output:
+	- Review the "Messages" for details about the process
+
+*/
+
+CREATE PROCEDURE spr_ManageVLFs
+	-- Specify the database you want to work with
+	@dbName NVARCHAR(256) = ''
 AS
 BEGIN
 	
