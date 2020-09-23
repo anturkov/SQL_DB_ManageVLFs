@@ -17,6 +17,9 @@ Requirements:
 - Log file must be larger than 512 MB
 - Only one Transaction log file is allowed
 
+Remark: 
+- If the database has a larger log file than 64 GB this script will only size it up to 64 GB.
+- After that, autogrowth events will trigger automatically to size the log to its required size
 
 Parameter:
 	- @dbName: Specify the database you want to work with
@@ -44,6 +47,8 @@ CREATE PROCEDURE spr_ManageVLFs
 AS
 BEGIN
 	
+	SET NOCOUNT ON;
+
 	-- Var for Dynamic SQL
 	DECLARE @cmd NVARCHAR(MAX)
 
@@ -69,7 +74,7 @@ BEGIN
 	DECLARE @autoGrowMB INT = 512
 	DECLARE @tmpGrowMB INT = 0
 
-	--How many times to grow the log
+	--How many times to grow the log in larger extents
 	DECLARE @growLogCounter INT = 0
 
 	-- How man times to shrink the file
@@ -82,7 +87,8 @@ BEGIN
 
 	--#############################################################
 	-- VERIFICATION
-
+	SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Starting validation'
+	RAISERROR(@msg, 10, 1) WITH NOWAIT;
 	-- Check if database is in an AG
 	IF EXISTS (
 		SELECT 1
@@ -95,33 +101,18 @@ BEGIN
 		RETURN;
 	END
 
+	-- Check if DB is SysDB
+	IF(@dbName IN ('master', 'model', 'msdb', 'tempdb'))
+	BEGIN
+		SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Database must not be a System DB'
+		RAISERROR(@msg, 10, 1) WITH NOWAIT;
+		RETURN;
+	END
+
 	-- Get VLFs Count
 	SET @orgVLFCount = (SELECT COUNT(1) FROM master.sys.dm_db_log_info(DB_ID(@dbName)))
 	SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Current VLF count = ' + CONVERT(NVARCHAR(32), @orgVLFCount)
 	RAISERROR(@msg, 10, 1) WITH NOWAIT;
-
-	-- Check if database is in Simple mode
-	SET @currRecoveryModel = (
-		SELECT recovery_model_desc 
-		FROM sys.databases
-		WHERE name = @dbName
-	)
-
-	IF (@currRecoveryModel != 'SIMPLE')
-	BEGIN
-		SET @cmd = '
-			USE [master];
-			ALTER DATABASE [' + @dbName + '] SET RECOVERY SIMPLE WITH NO_WAIT;
-		';
-		BEGIN TRY
-			EXEC sp_executesql @cmd
-		END TRY
-		BEGIN CATCH
-			SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Could not change recovery model to simple - terminating script'
-			RAISERROR(@msg, 10, 1) WITH NOWAIT;
-			RETURN;
-		END CATCH
-	END
 
 	-- Check if there are more than 1 log file --> terminate
 	IF(
@@ -206,15 +197,56 @@ BEGIN
 	END
 
 	--###########################################
+	-- Processing
+	SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Starting process'
+	RAISERROR(@msg, 10, 1) WITH NOWAIT;
+
+	-- Check if database is in Simple mode
+	SET @currRecoveryModel = (
+		SELECT recovery_model_desc 
+		FROM sys.databases
+		WHERE name = @dbName
+	)
+
+	IF (@currRecoveryModel != 'SIMPLE')
+	BEGIN
+		SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Configuring SIMPLE recovery model'
+		RAISERROR(@msg, 10, 1) WITH NOWAIT;
+
+		SET @cmd = '
+			USE [master];
+			ALTER DATABASE [' + @dbName + '] SET RECOVERY SIMPLE WITH NO_WAIT;
+		';
+		BEGIN TRY
+			EXEC sp_executesql @cmd
+		END TRY
+		BEGIN CATCH
+			SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Could not change recovery model to SIMPLE' + CHAR(13) + CHAR(10) +
+			'Error Number: ' + CONVERT(NVARCHAR(32), ERROR_NUMBER()) + CHAR(13) + CHAR(10) +
+			'Error Message: ' + ERROR_MESSAGE();
+			RAISERROR(@msg, 10, 1) WITH NOWAIT;
+			RETURN;
+		END CATCH
+	END
 	-- Shrink log file
 	SET @cmd = '
 		USE [' + @dbName + '];
 		DBCC SHRINKFILE (N''' + @logName + ''' , 1);
 	'
-
+	SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Shrinking log file to 1 MB'
+	RAISERROR(@msg, 10, 1) WITH NOWAIT;
 	WHILE (@i <= @shrinkLoops)
 	BEGIN
-		EXEC sp_executesql @cmd
+		BEGIN TRY
+			EXEC sp_executesql @cmd
+		END TRY
+		BEGIN CATCH
+			SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Shrink log file operation failed' + CHAR(13) + CHAR(10) +
+			'Error Number: ' + CONVERT(NVARCHAR(32), ERROR_NUMBER()) + CHAR(13) + CHAR(10) +
+			'Error Message: ' + ERROR_MESSAGE();
+			RAISERROR(@msg, 10, 1) WITH NOWAIT;
+			RETURN;
+		END CATCH
 		SET @i += 1;
 	END
 
@@ -237,22 +269,52 @@ BEGIN
 		RETURN;
 	END
 	
+	SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Starting log pre-sizing'
+	RAISERROR(@msg, 10, 1) WITH NOWAIT;
 
 	-- Resize LOG
 	SET @cmd = 'ALTER DATABASE [' + @dbName + '] MODIFY FILE ( NAME = N''' + @logName + ''', SIZE = ' + CONVERT(NVARCHAR(32), @growStepsMB) + 'MB )';
 	SET @tmpGrowMB = @growStepsMB
-	EXEC sp_executesql @cmd
+
+	SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Configuring Log Size: ' + CONVERT(NVARCHAR(32), @tmpGrowMB) + ' MB'
+	RAISERROR(@msg, 10, 1) WITH NOWAIT;
+
+	BEGIN TRY
+		EXEC sp_executesql @cmd
+	END TRY
+	BEGIN CATCH
+		SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Pre-Sizing log to ' + CONVERT(NVARCHAR(32), @tmpGrowMB) + ' MB failed' + CHAR(13) + CHAR(10) +
+		'Error Number: ' + CONVERT(NVARCHAR(32), ERROR_NUMBER()) + CHAR(13) + CHAR(10) +
+		'Error Message: ' + ERROR_MESSAGE();
+		RAISERROR(@msg, 10, 1) WITH NOWAIT;
+		RETURN;
+	END CATCH
 
 	WHILE @growLogCounter != 1
 	BEGIN
 		SET @tmpGrowMB += @growStepsMB
 		SET @cmd = 'ALTER DATABASE [' + @dbName + '] MODIFY FILE ( NAME = N''' + @logName + ''', SIZE = ' + CONVERT(NVARCHAR(32), @tmpGrowMB) + 'MB )';
-		EXEC sp_executesql @cmd
+
+		SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Configuring Log Size: ' + CONVERT(NVARCHAR(32), @tmpGrowMB) + ' MB'
+		RAISERROR(@msg, 10, 1) WITH NOWAIT;
+
+		BEGIN TRY
+			EXEC sp_executesql @cmd
+		END TRY
+		BEGIN CATCH
+			SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Pre-Sizing log to ' + CONVERT(NVARCHAR(32), @tmpGrowMB) + ' MB failed' + CHAR(13) + CHAR(10) +
+			'Error Number: ' + CONVERT(NVARCHAR(32), ERROR_NUMBER()) + CHAR(13) + CHAR(10) +
+			'Error Message: ' + ERROR_MESSAGE();
+			RAISERROR(@msg, 10, 1) WITH NOWAIT;
+			RETURN;
+		END CATCH
 		
 		SET @growLogCounter = @growLogCounter - 1
 	END
 
 	-- SET AUTOGROW
+	SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Configuring auto-growth setting to ' + CONVERT(NVARCHAR(32), @autoGrowMB) + ' MB';
+	RAISERROR(@msg, 10, 1) WITH NOWAIT;
 	SET @cmd = '
 	USE [master];
 	ALTER DATABASE [' + @dbName + '] MODIFY FILE ( NAME = N''' + @logName + ''', FILEGROWTH = ' + CONVERT(NVARCHAR(32), @autoGrowMB) + 'MB );
@@ -262,14 +324,25 @@ BEGIN
 	-- RESET Recovery Model
 	IF(@currRecoveryModel != 'SIMPLE')
 	BEGIN
+		SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Reconfiguring recovery model to ' + @currRecoveryModel + CHAR(13) + CHAR(10) +
+		'Please perform a FULL backup to initiate the backup chain';
+		RAISERROR(@msg, 10, 1) WITH NOWAIT;
+
 		SET @cmd = '
 			USE [master];
 			ALTER DATABASE [' + @dbName + '] SET RECOVERY ' + @currRecoveryModel + ' WITH NO_WAIT;
 		';
-		EXEC sp_executesql @cmd
+		BEGIN TRY
+			EXEC sp_executesql @cmd
+		END TRY
+		BEGIN CATCH
+			SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Could not change recovery model to ' + @currRecoveryModel + CHAR(13) + CHAR(10) +
+			'Error Number: ' + CONVERT(NVARCHAR(32), ERROR_NUMBER()) + CHAR(13) + CHAR(10) +
+			'Error Message: ' + ERROR_MESSAGE();
+			RAISERROR(@msg, 10, 1) WITH NOWAIT;
+			RETURN;
+		END CATCH
 
-		SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Recovery Model set to "' + @currRecoveryModel + '". Please create full backup after this process to start the backup chain!'
-		RAISERROR(@msg, 10, 1) WITH NOWAIT;
 	END
 
 	-- Get new VLF Count
